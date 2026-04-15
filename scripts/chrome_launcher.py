@@ -41,8 +41,8 @@ def get_chrome_path() -> str:
     elif sys.platform == "darwin":
         candidates.extend(
             [
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                os.path.expanduser("~/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
             ]
         )
     else:
@@ -140,6 +140,7 @@ def launch_chrome(
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
     ]
 
     if headless:

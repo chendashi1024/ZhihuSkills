@@ -2,6 +2,7 @@
 name: ZhihuSkills
 description: |
   将文章内容自动发布到知乎专栏。
+  使用 CDP + ClipboardEvent paste 方案，正确触发 Draft.js EditorState 更新。
   支持两类任务：发布文章、仅启动测试浏览器（不发布）。
 metadata:
   trigger: 发布内容到知乎

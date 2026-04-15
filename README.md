@@ -1,10 +1,11 @@
 # ZhihuSkills
 
 自动发布文章到知乎专栏的命令行工具，也支持仅启动测试浏览器（不发布）。
-通过 Chrome DevTools Protocol (CDP) 实现自动化发布，支持多账号管理、无头模式运行。
+通过 Chrome DevTools Protocol (CDP) 实现自动化发布，使用 ClipboardEvent paste
+注入正文到 Draft.js 编辑器，正确触发 React EditorState 更新，使发布按钮自然激活。
 
 ## 功能特性
-- **自动化发布**：自动填写标题、正文、上传图片
+- **自动化发布**：自动填写标题、正文、上传图片，发布按钮自然激活
 - **纯文字发布**：知乎文章支持无图片发布
 - **多账号支持**：支持管理多个知乎账号，各账号 Cookie 隔离
 - **无头模式**：支持后台运行，无需显示浏览器窗口
@@ -13,12 +14,18 @@
 - **登录检测**：自动检测登录状态，未登录时自动切换到有窗口模式
 - **登录状态缓存**：`check_login` 默认本地缓存 12 小时，减少重复跳转校验
 
+## 技术原理
+
+知乎编辑器使用 Draft.js，直接设置 innerHTML 不会更新 React 内部的 EditorState，
+导致发布按钮始终禁用。本工具通过构造 `ClipboardEvent('paste')` 事件注入正文，
+Draft.js 会拦截粘贴事件并正确更新内部状态，从而使发布按钮自然激活。
+
 ## 安装
 
 ### 环境要求
 
 - Python 3.10+
-- Google Chrome 浏览器
+- Google Chrome 或 Microsoft Edge 浏览器
 
 ### 安装依赖
 
@@ -61,7 +68,7 @@ python scripts/chrome_launcher.py --kill
 ### 3. 发布文章
 
 ```bash
-# 无头模式发布（推荐，默认自动发布）
+# 无头模式发布（推荐）
 python scripts/publish_pipeline.py --headless \
     --title "文章标题" \
     --content "文章正文" \

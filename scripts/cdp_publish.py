@@ -2,6 +2,8 @@
 基于 CDP 的知乎文章发布器。
 
 通过 Chrome DevTools Protocol 连接 Chrome 实例，自动化在知乎专栏发布文章。
+使用 ClipboardEvent paste 注入正文到 Draft.js 编辑器，正确触发 React
+EditorState 更新，使发布按钮自然激活。
 
 CLI 用法:
     python cdp_publish.py [--host HOST] [--port PORT] check-login [--headless] [--account NAME] [--reuse-existing-tab]
@@ -324,6 +326,14 @@ class ZhihuPublisher:
         self.ws = ws_client.connect(ws_url)
         print("[cdp_publish] 已连接到 Chrome 标签页。")
 
+        # 反检测：隐藏 webdriver 标记
+        try:
+            self._send("Page.addScriptToEvaluateOnNewDocument", {
+                "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            })
+        except Exception:
+            pass
+
     def disconnect(self):
         """关闭 WebSocket 连接。"""
         if self.ws:
@@ -533,14 +543,18 @@ class ZhihuPublisher:
     # ------------------------------------------------------------------
 
     def _fill_title(self, title: str):
-        """填写文章标题（知乎使用 textarea）。"""
+        """填写文章标题。
+
+        使用 React 兼容的 nativeSetter 方式设置 textarea 值，
+        并触发 input/change 事件确保 React 状态同步。
+        """
         print(f"[cdp_publish] 正在设置标题: {title[:40]}...")
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
 
+        escaped_title = json.dumps(title)
         for selector in (SELECTORS["title_input"], SELECTORS["title_input_alt"]):
             found = self._evaluate(f"!!document.querySelector('{selector}')")
             if found:
-                escaped_title = json.dumps(title)
                 self._evaluate(f"""
                     (function() {{
                         var el = document.querySelector('{selector}');
@@ -559,37 +573,65 @@ class ZhihuPublisher:
         raise CDPError("找不到标题输入框。")
 
     def _fill_content(self, content: str):
-        """填写文章正文（知乎使用 Draft.js 编辑器）。"""
+        """填写文章正文。
+
+        通过 JS 构造 ClipboardEvent('paste') 注入正文到 Draft.js 编辑器。
+        Draft.js 会拦截粘贴事件并正确更新内部 EditorState，
+        从而使发布按钮自然激活。
+        """
         print(f"[cdp_publish] 正在设置正文 ({len(content)} 字符)...")
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
 
+        # 通过 CDP 定位并聚焦正文编辑器
+        focused = False
         for selector in (SELECTORS["content_editor"], SELECTORS["content_editor_alt"]):
             found = self._evaluate(f"!!document.querySelector('{selector}')")
             if found:
-                escaped = json.dumps(content)
-                self._evaluate(f"""
+                rect = self._evaluate(f"""
                     (function() {{
                         var el = document.querySelector('{selector}');
                         el.focus();
-                        var text = {escaped};
-                        var lines = text.split('\\n');
-                        var html = [];
-                        for (var i = 0; i < lines.length; i++) {{
-                            var line = lines[i];
-                            if (line.trim()) {{
-                                html.push('<div data-block="true"><div class="public-DraftStyleDefault-block"><span>' + line + '</span></div></div>');
-                            }} else {{
-                                html.push('<div data-block="true"><div class="public-DraftStyleDefault-block"><br></div></div>');
-                            }}
-                        }}
-                        el.innerHTML = html.join('');
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        var r = el.getBoundingClientRect();
+                        return {{ x: r.x, y: r.y, width: r.width, height: r.height }};
                     }})();
                 """)
-                print("[cdp_publish] 正文已设置。")
-                return
+                if rect:
+                    # CDP 鼠标点击确保光标定位
+                    cx = rect["x"] + rect["width"] / 2
+                    cy = rect["y"] + min(20, rect["height"] / 2)
+                    self._click_mouse(cx, cy)
+                    focused = True
+                break
 
-        raise CDPError("找不到正文编辑器。")
+        if not focused:
+            raise CDPError("找不到正文编辑器。")
+
+        self._sleep(0.3, minimum_seconds=0.1)
+
+        # 通过 ClipboardEvent paste 注入正文
+        escaped_content = json.dumps(content)
+        result = self._evaluate(f"""
+            (function() {{
+                var el = document.querySelector('.public-DraftEditor-content[contenteditable="true"]');
+                if (!el) return false;
+                el.focus();
+                var dt = new DataTransfer();
+                dt.setData('text/plain', {escaped_content});
+                var evt = new ClipboardEvent('paste', {{
+                    clipboardData: dt,
+                    bubbles: true,
+                    cancelable: true,
+                }});
+                el.dispatchEvent(evt);
+                return true;
+            }})();
+        """)
+
+        if not result:
+            raise CDPError("正文粘贴事件派发失败。")
+
+        self._sleep(0.5, minimum_seconds=0.2)
+        print("[cdp_publish] 正文已设置。")
 
     def _upload_images(self, image_paths: list[str]):
         """通过 file input 上传图片。"""
@@ -676,30 +718,49 @@ class ZhihuPublisher:
             return False
 
     def _click_publish(self):
-        """通过 CDP 鼠标事件点击发布按钮。"""
+        """点击发布按钮。
+
+        由于标题通过 nativeSetter、正文通过 ClipboardEvent paste
+        都正确触发了 React 状态更新，发布按钮应已自然激活。
+        如果仍被禁用，回退到强制启用方案。
+        """
         print("[cdp_publish] 正在点击发布按钮...")
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
 
-        # 先尝试激活按钮
-        if not self._activate_publish_button():
-            print("[cdp_publish] ⚠️  无法自动激活发布按钮，请手动输入一个字符后再发布。")
-            return None
+        # 检查按钮是否激活
+        btn_status = self._evaluate("""
+            (() => {
+                const buttons = document.querySelectorAll('button');
+                for (let btn of buttons) {
+                    if (btn.textContent.trim() === '发布') {
+                        return {
+                            found: true,
+                            disabled: btn.disabled,
+                            text: btn.textContent.trim(),
+                        };
+                    }
+                }
+                return { found: false };
+            })()
+        """)
 
+        if not btn_status or not btn_status.get("found"):
+            raise CDPError("找不到发布按钮。")
+
+        if btn_status.get("disabled"):
+            print("[cdp_publish] ⚠️ 发布按钮仍被禁用，尝试强制启用...")
+            if not self._activate_publish_button():
+                print("[cdp_publish] ⚠️ 无法激活发布按钮，请手动检查。")
+                return None
+
+        # 获取按钮坐标并通过 CDP 鼠标事件点击
         btn_text = SELECTORS["publish_button_text"]
         js_get_rect = f"""
             (function() {{
                 var buttons = document.querySelectorAll('button');
                 for (var i = 0; i < buttons.length; i++) {{
-                    var t = buttons[i].textContent.trim();
-                    if (t === '{btn_text}') {{
+                    if (buttons[i].textContent.trim() === '{btn_text}') {{
                         var r = buttons[i].getBoundingClientRect();
-                        return {{ x: r.x, y: r.y, width: r.width, height: r.height }};
-                    }}
-                }}
-                var primaryBtns = document.querySelectorAll('button.Button--primary');
-                for (var j = 0; j < primaryBtns.length; j++) {{
-                    if (primaryBtns[j].textContent.trim().indexOf('{btn_text}') !== -1) {{
-                        var r = primaryBtns[j].getBoundingClientRect();
                         return {{ x: r.x, y: r.y, width: r.width, height: r.height }};
                     }}
                 }}
@@ -735,10 +796,28 @@ class ZhihuPublisher:
         current_url = self._evaluate("window.location.href") or ""
         if "zhuanlan.zhihu.com/write" not in current_url:
             self._navigate(ZHIHU_WRITE_URL)
-            self._sleep(3, minimum_seconds=2.0)
+            self._sleep(5, minimum_seconds=3.0)
         else:
             # 已在写文章页，等待页面就绪
             self._sleep(1, minimum_seconds=0.5)
+
+        # 检查是否被重定向到安全验证页
+        current_url = self._evaluate("window.location.href") or ""
+        if "unhuman" in current_url or "account/unhuman" in current_url:
+            raise CDPError("知乎触发了安全验证（反爬），请在有窗口模式下手动完成验证后重试。")
+
+        # 等待标题输入框出现（最多重试 3 次，每次等 3 秒）
+        for attempt in range(3):
+            for sel in (SELECTORS["title_input"], SELECTORS["title_input_alt"]):
+                found = self._evaluate(f"!!document.querySelector('{sel}')")
+                if found:
+                    break
+            else:
+                if attempt < 2:
+                    print(f"[cdp_publish] 等待编辑器加载... (第{attempt+1}次)")
+                    self._sleep(3, minimum_seconds=2.0)
+                    continue
+            break
 
         self._fill_title(title)
         self._fill_content(content)
